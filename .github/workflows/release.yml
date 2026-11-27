@@ -138,6 +138,50 @@ jobs:
       UPSTREAM_COMMIT: ${{ needs.plan.outputs.upstream_commit }}
       FINGERPRINT: ${{ needs.plan.outputs.fingerprint }}
     steps:
+      - name: Remove stale drafts for this tag
+        shell: pwsh
+        run: |
+          $releaseJson = @(& gh api --paginate --slurp "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" 2>&1)
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host 'LIVE RELEASE ERROR CATEGORY: stale-draft-sweep-list'
+            throw 'Could not inspect existing releases for stale drafts.'
+          }
+          try {
+            $pages = ($releaseJson -join "`n") | ConvertFrom-Json
+            $releases = foreach ($page in @($pages)) {
+              foreach ($release in @($page)) { $release }
+            }
+          }
+          catch {
+            Write-Host 'LIVE RELEASE ERROR CATEGORY: stale-draft-sweep-parse'
+            throw 'Could not parse the existing release list.'
+          }
+          $stale = @($releases | Where-Object { $_.draft -eq $true -and $_.tag_name -eq $env:TAG })
+          foreach ($candidate in $stale) {
+            if (-not $candidate.id) {
+              Write-Host 'LIVE RELEASE ERROR CATEGORY: stale-draft-sweep-invalid-release'
+              throw 'A stale draft had no release id.'
+            }
+            $id = [int64]$candidate.id
+            $detailJson = @(& gh api "repos/$env:GITHUB_REPOSITORY/releases/$id" 2>&1)
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host 'LIVE RELEASE ERROR CATEGORY: stale-draft-sweep-read'
+              throw 'Could not recheck a stale draft before deletion.'
+            }
+            $detail = ($detailJson -join "`n") | ConvertFrom-Json
+            if ($detail.draft -ne $true -or $detail.tag_name -ne $env:TAG) { continue }
+            gh api --method DELETE "repos/$env:GITHUB_REPOSITORY/releases/$id" *> (Join-Path $env:RUNNER_TEMP 'stale-draft-delete.log')
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host 'LIVE RELEASE ERROR CATEGORY: stale-draft-sweep-delete'
+              throw 'Could not delete a stale draft.'
+            }
+            # Draft releases normally have no tag ref, but remove one only after
+            # the draft-only recheck above, never for a published release.
+            gh api --method DELETE "repos/$env:GITHUB_REPOSITORY/git/refs/tags/$env:TAG" *> (Join-Path $env:RUNNER_TEMP 'stale-tag-delete.log')
+            $LASTEXITCODE = 0
+          }
+          exit 0
+
       - name: Create draft release
         id: create
         shell: pwsh
@@ -271,7 +315,7 @@ jobs:
           foreach ($file in $files) {
             $name = [System.IO.Path]::GetFileName($file)
             if ($name -notmatch '^[A-Za-z0-9._-]+$') { throw 'A release asset name is invalid.' }
-            $assetUri = "repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID/assets?name=$([uri]::EscapeDataString($name))"
+            $assetUri = "https://uploads.github.com/repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID/assets?name=$([uri]::EscapeDataString($name))"
             & gh api --method POST $assetUri --header 'Content-Type: application/octet-stream' --input $file *> (Join-Path $env:RUNNER_TEMP 'release-upload.log')
             if ($LASTEXITCODE -ne 0) { throw 'Draft asset upload failed.' }
           }
@@ -354,6 +398,15 @@ jobs:
             "$hash  $($file.Name)"
           }
           [System.IO.File]::WriteAllText((Join-Path (Get-Location) 'release-assets/SHA256SUMS'), (($lines -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
+          exit 0
+
+      - name: Upload SHA256SUMS to draft
+        shell: pwsh
+        run: |
+          $checksumFile = Join-Path (Get-Location) 'release-assets/SHA256SUMS'
+          $assetUri = "https://uploads.github.com/repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID/assets?name=SHA256SUMS"
+          & gh api --method POST $assetUri --header 'Content-Type: application/octet-stream' --input $checksumFile *> (Join-Path $env:RUNNER_TEMP 'checksum-upload.log')
+          if ($LASTEXITCODE -ne 0) { throw 'SHA256SUMS upload failed.' }
           exit 0
 
       - name: Clone private validation scripts
