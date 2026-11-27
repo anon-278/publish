@@ -252,14 +252,6 @@ jobs:
             Pop-Location
           }
 
-      - name: Set up Vite+
-        uses: voidzero-dev/setup-vp@v1.21.2
-        with:
-          working-directory: ${{ runner.temp }}/upstream-source
-          node-version-file: ${{ runner.temp }}/upstream-source/package.json
-          cache: false
-          run-install: false
-
       - name: Apply patch series with suppressed output
         shell: pwsh
         env:
@@ -275,6 +267,14 @@ jobs:
             Write-Host 'LIVE VALIDATE ERROR CATEGORY: apply'
             throw 'Patch application failed; details are suppressed.'
           }
+
+      - name: Set up Vite+
+        uses: voidzero-dev/setup-vp@v1.21.2
+        with:
+          working-directory: ${{ runner.temp }}/upstream-source
+          node-version-file: ${{ runner.temp }}/upstream-source/package.json
+          cache: false
+          run-install: false
 
       - name: Run privacy-safe validation and package
         shell: pwsh
