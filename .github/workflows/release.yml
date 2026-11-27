@@ -469,15 +469,18 @@ jobs:
           )
           for ($attempt = 1; ; $attempt++) {
             try {
-              $latest = Invoke-RestMethod -Uri "$base/latest" -Headers @{ Accept = 'application/json' }
+              $latest = Invoke-RestMethod `
+                -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/latest" `
+                -Headers @{ Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } `
+                -ErrorAction Stop
               if ($latest.tag_name -ne $env:TAG -or $latest.draft -or $latest.prerelease) { throw 'The published latest release is not the expected stable tag.' }
               foreach ($name in @('latest.yml', 'latest-linux.yml', 'SHA256SUMS')) {
-                $remote = (Invoke-WebRequest -Uri "$base/download/$env:TAG/$name").Content
+                $remote = (Invoke-WebRequest -Uri "$base/download/$env:TAG/$name" -MaximumRedirection 5 -ErrorAction Stop).Content
                 $local = Get-Content -LiteralPath (Join-Path 'release-assets' $name) -Raw
                 if ($remote -ne $local) { throw "Published $name differs from the verified bytes." }
               }
               foreach ($name in $expected) {
-                $null = Invoke-WebRequest -Uri "$base/download/$env:TAG/$name" -Headers @{ Range = 'bytes=0-0' }
+                $null = Invoke-WebRequest -Method Head -Uri "$base/download/$env:TAG/$name" -MaximumRedirection 5 -ErrorAction Stop
               }
               Write-Host "Published $env:TAG as the latest stable release with all eight assets."
               break
