@@ -1,6 +1,11 @@
-name: Discover upstream stable release (dry run)
+name: Discover upstream stable release
+
+# Polls the official stable feed and, when the private lock is behind, opens
+# one update PR in the private repository through the discover token.
 
 on:
+  schedule:
+    - cron: '17 */2 * * *'
   workflow_dispatch:
   repository_dispatch:
     types: [discover]
@@ -9,14 +14,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: public-dry-discover
-  cancel-in-progress: true
+  group: public-discover
+  cancel-in-progress: false
 
 jobs:
   discover:
-    name: Compare upstream stable release
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    name: Discover and prepare stable update
+    runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout public workflow repository
         uses: actions/checkout@v4
@@ -26,32 +31,143 @@ jobs:
         env:
           PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
           PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
-          PRIVATE_REPO_READ_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          PRIVATE_REPO_DISCOVER_TOKEN: ${{ secrets.PRIVATE_REPO_DISCOVER_TOKEN }}
           MANAGER_DIR: ${{ runner.temp }}/private-manager
         run: |
           pwsh -NoProfile -File ./scripts/secure-clone.ps1 `
             -Owner $env:PRIVATE_REPO_OWNER `
             -Name $env:PRIVATE_REPO_NAME `
-            -Token $env:PRIVATE_REPO_READ_TOKEN `
-            -Destination $env:MANAGER_DIR
+            -Token $env:PRIVATE_REPO_DISCOVER_TOKEN `
+            -Destination $env:MANAGER_DIR `
+            -Branch master
           if ($LASTEXITCODE -ne 0) { throw 'Could not clone the private patch manager.' }
           "MANAGER_DIR=$env:MANAGER_DIR" >> $env:GITHUB_ENV
 
-      - name: Compare public upstream metadata with the private lock
+      - name: Compare and open stable update PR
         shell: pwsh
         env:
+          PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
+          PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
+          PRIVATE_REPO_DISCOVER_TOKEN: ${{ secrets.PRIVATE_REPO_DISCOVER_TOKEN }}
           MANAGER_DIR: ${{ runner.temp }}/private-manager
         run: |
+          $repo = "$env:PRIVATE_REPO_OWNER/$env:PRIVATE_REPO_NAME"
+          Write-Output "::add-mask::$repo"
+          Write-Output "::add-mask::https://github.com/$repo"
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:PRIVATE_REPO_DISCOVER_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
           try {
-            $releases = Invoke-RestMethod -Method Get -Uri 'https://api.github.com/repos/pingdotgg/t3code/releases?per_page=100' -Headers @{ Accept = 'application/vnd.github+json' }
-            $latest = @($releases | Where-Object { -not $_.draft -and -not $_.prerelease -and $_.tag_name -notmatch '-nightly\.' } | Sort-Object published_at | Select-Object -Last 1)
-            if (-not $latest) { throw 'No upstream stable release was found.' }
-            $lock = Get-Content -LiteralPath (Join-Path $env:MANAGER_DIR 'upstream.lock.json') -Raw | ConvertFrom-Json
+            $releases = Invoke-RestMethod `
+              -Uri 'https://api.github.com/repos/pingdotgg/t3code/releases?per_page=100' `
+              -Headers @{ Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' } `
+              -ErrorAction Stop
+            $release = @(
+              $releases |
+                Where-Object { -not $_.draft -and -not $_.prerelease -and $_.tag_name -notmatch '-nightly\.' } |
+                Sort-Object published_at -Descending |
+                Select-Object -First 1
+            ) | Select-Object -First 1
+            if (-not $release) { throw 'No published stable upstream release was found.' }
+            if ([string]$release.tag_name -notmatch '^v\d+\.\d+\.\d+$') { throw 'The upstream stable tag has an unexpected format.' }
+
+            $lockPath = Join-Path $env:MANAGER_DIR 'upstream.lock.json'
+            $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
             if ($lock.channel -ne 'stable') { throw 'The private lock is not on the stable channel.' }
-            $same = $latest.tag_name -eq $lock.stableTag
-            Write-Host "DRY RUN ONLY: upstream stable $($latest.tag_name); locked stable $($lock.stableTag); changed=$($same -eq $false)."
-            Write-Host 'No branch, commit, pull request, or repository setting was changed.'
+            if ($lock.stableTag -eq $release.tag_name) {
+              Write-Host "Stable $($release.tag_name) is already locked."
+              exit 0
+            }
+
+            $tag = [string]$release.tag_name
+            $branch = "stable/$tag"
+            $encodedBranch = [uri]::EscapeDataString($branch)
+            $branchResponse = Invoke-WebRequest `
+              -Uri "https://api.github.com/repos/$repo/git/ref/heads/$encodedBranch" `
+              -Headers $headers -SkipHttpErrorCheck -ErrorAction Stop
+            if ($branchResponse.StatusCode -eq 200) {
+              Write-Host "Stable update branch already exists for $tag."
+              exit 0
+            }
+            if ($branchResponse.StatusCode -ne 404) { throw 'Could not inspect the stable update branch.' }
+
+            $headQuery = [uri]::EscapeDataString("$env:PRIVATE_REPO_OWNER`:$branch")
+            $openPrs = Invoke-RestMethod `
+              -Uri "https://api.github.com/repos/$repo/pulls?state=open&base=master&head=$headQuery&per_page=10" `
+              -Headers $headers -ErrorAction Stop
+            if (@($openPrs).Count -gt 0) {
+              Write-Host "An open stable update PR already exists for $tag."
+              exit 0
+            }
+
+            $refsLog = Join-Path $env:RUNNER_TEMP 'upstream-refs.log'
+            & git ls-remote 'https://github.com/pingdotgg/t3code.git' "refs/tags/$tag" "refs/tags/$tag^{}" *> $refsLog
+            if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the upstream stable tag.' }
+            $refs = Get-Content -LiteralPath $refsLog
+            $peeled = $refs | Where-Object { $_ -match '\^\{\}' } | Select-Object -First 1
+            $line = if ($peeled) { $peeled } else { $refs | Select-Object -First 1 }
+            $commit = ($line -split '\s+')[0]
+            if ($commit -notmatch '^[0-9a-f]{40}$') { throw 'Could not resolve the upstream stable commit.' }
+
+            Push-Location -LiteralPath $env:MANAGER_DIR
+            try {
+              & git switch --quiet -c $branch *> (Join-Path $env:RUNNER_TEMP 'stable-branch.log')
+              if ($LASTEXITCODE -ne 0) { throw 'Could not create the stable update branch.' }
+              & pwsh -NoProfile -File ./scripts/set-stable-lock.ps1 `
+                -Tag $tag `
+                -Version $tag `
+                -Commit $commit `
+                -ReleaseUrl ([string]$release.html_url) `
+                -PublishedAt ([string]$release.published_at) *> (Join-Path $env:RUNNER_TEMP 'stable-lock.log')
+              if ($LASTEXITCODE -ne 0) { throw 'Could not update the stable lock.' }
+              & git config user.name 'custom automation bot'
+              & git config user.email 'custom-automation[bot]@users.noreply.github.com'
+              & git add upstream.lock.json
+              & git commit --quiet -m "chore: target $tag" *> (Join-Path $env:RUNNER_TEMP 'stable-commit.log')
+              if ($LASTEXITCODE -ne 0) { throw 'Could not commit the stable lock update.' }
+
+              $remoteUrl = "https://github.com/$repo.git"
+              & git remote add private $remoteUrl *> (Join-Path $env:RUNNER_TEMP 'stable-remote.log')
+              if ($LASTEXITCODE -ne 0) { throw 'Could not configure the private update remote.' }
+              $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("x-access-token:$env:PRIVATE_REPO_DISCOVER_TOKEN"))
+              $oldConfigCount = $env:GIT_CONFIG_COUNT
+              $oldConfigKey = $env:GIT_CONFIG_KEY_0
+              $oldConfigValue = $env:GIT_CONFIG_VALUE_0
+              $oldPrompt = $env:GIT_TERMINAL_PROMPT
+              try {
+                $env:GIT_CONFIG_COUNT = '1'
+                $env:GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader'
+                $env:GIT_CONFIG_VALUE_0 = "AUTHORIZATION: basic $auth"
+                $env:GIT_TERMINAL_PROMPT = '0'
+                & git push --quiet --set-upstream private $branch *> (Join-Path $env:RUNNER_TEMP 'stable-push.log')
+                if ($LASTEXITCODE -ne 0) { throw 'Could not push the stable update branch.' }
+              }
+              finally {
+                if ($null -eq $oldConfigCount) { Remove-Item Env:GIT_CONFIG_COUNT -ErrorAction SilentlyContinue } else { $env:GIT_CONFIG_COUNT = $oldConfigCount }
+                if ($null -eq $oldConfigKey) { Remove-Item Env:GIT_CONFIG_KEY_0 -ErrorAction SilentlyContinue } else { $env:GIT_CONFIG_KEY_0 = $oldConfigKey }
+                if ($null -eq $oldConfigValue) { Remove-Item Env:GIT_CONFIG_VALUE_0 -ErrorAction SilentlyContinue } else { $env:GIT_CONFIG_VALUE_0 = $oldConfigValue }
+                if ($null -eq $oldPrompt) { Remove-Item Env:GIT_TERMINAL_PROMPT -ErrorAction SilentlyContinue } else { $env:GIT_TERMINAL_PROMPT = $oldPrompt }
+              }
+            }
+            finally {
+              Pop-Location
+            }
+
+            $prBody = @(
+              "Target published upstream stable $tag at commit $commit."
+              ''
+              'The public automation will validate the patch stack before merge.'
+            ) -join "`n"
+            $payload = @{ title = "chore: update to stable $tag"; head = $branch; base = 'master'; body = $prBody } | ConvertTo-Json -Compress
+            $created = Invoke-RestMethod -Method Post `
+              -Uri "https://api.github.com/repos/$repo/pulls" `
+              -Headers $headers -ContentType 'application/json' -Body $payload -ErrorAction Stop
+            Write-Host "Opened stable update PR #$($created.number)."
           }
           catch {
-            throw 'Stable-release comparison failed; details are suppressed.'
+            Write-Host 'LIVE DISCOVER ERROR CATEGORY: stable-update'
+            throw 'Stable discovery or update preparation failed; details are suppressed.'
           }
+          exit 0
