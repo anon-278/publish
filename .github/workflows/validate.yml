@@ -224,7 +224,7 @@ jobs:
         shell: pwsh
         env:
           MANAGER_DIR: ${{ runner.temp }}/private-manager
-          RELEASE_REPO: ${{ vars.RELEASE_REPO }}
+          RELEASE_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
         run: |
           if ($env:RELEASE_REPO -notmatch '^[^/\s]+/[^/\s]+$') { throw 'The public release repository is not configured.' }
@@ -259,7 +259,7 @@ jobs:
           SOURCE_DIR: ${{ runner.temp }}/upstream-source
           PLATFORM: ${{ matrix.platform }}
           FULL_BUILD: ${{ matrix.full_build }}
-          RELEASE_REPO: ${{ vars.RELEASE_REPO }}
+          RELEASE_REPO: ${{ github.repository }}
         run: |
           $args = @(
             '-NoProfile', '-File', './scripts/dry-run-build.ps1',
