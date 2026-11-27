@@ -124,6 +124,8 @@ jobs:
   stage:
     name: Create draft release
     needs: plan
+    outputs:
+      release_id: ${{ steps.create.outputs.release_id }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -137,6 +139,7 @@ jobs:
       FINGERPRINT: ${{ needs.plan.outputs.fingerprint }}
     steps:
       - name: Create draft release
+        id: create
         shell: pwsh
         run: |
           $notes = @(
@@ -148,8 +151,16 @@ jobs:
             ''
             "build-fingerprint: $env:FINGERPRINT"
           ) -join "`n"
-          gh release create $env:TAG --repo $env:GITHUB_REPOSITORY --title "T3 Code $env:VERSION" --notes $notes --draft
+          $releaseJson = @(& gh api --method POST "repos/$env:GITHUB_REPOSITORY/releases" `
+            -f "tag_name=$env:TAG" `
+            -f "name=T3 Code $env:VERSION" `
+            -f "body=$notes" `
+            -F draft=true `
+            -F prerelease=false 2>&1)
           if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed.' }
+          $release = ($releaseJson -join "`n") | ConvertFrom-Json
+          if (-not $release.id -or -not $release.draft) { throw 'Draft release creation returned no draft release id.' }
+          "release_id=$($release.id)" >> $env:GITHUB_OUTPUT
           exit 0
 
   build:
@@ -252,13 +263,18 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_ID: ${{ needs.stage.outputs.release_id }}
           ASSET_DIR: ${{ steps.assets.outputs.asset_dir }}
         run: |
           $files = @(Get-ChildItem -LiteralPath $env:ASSET_DIR -File | ForEach-Object FullName)
           if ($files.Count -eq 0) { throw 'No platform assets were collected.' }
-          & gh release upload $env:TAG @files --repo $env:GITHUB_REPOSITORY --clobber
-          if ($LASTEXITCODE -ne 0) { throw 'Draft asset upload failed.' }
+          foreach ($file in $files) {
+            $name = [System.IO.Path]::GetFileName($file)
+            if ($name -notmatch '^[A-Za-z0-9._-]+$') { throw 'A release asset name is invalid.' }
+            $assetUri = "repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID/assets?name=$([uri]::EscapeDataString($name))"
+            & gh api --method POST $assetUri --header 'Content-Type: application/octet-stream' --input $file *> (Join-Path $env:RUNNER_TEMP 'release-upload.log')
+            if ($LASTEXITCODE -ne 0) { throw 'Draft asset upload failed.' }
+          }
           exit 0
 
   finalize:
@@ -272,6 +288,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ needs.plan.outputs.tag }}
+      RELEASE_ID: ${{ needs.stage.outputs.release_id }}
       VERSION: ${{ needs.plan.outputs.version }}
       PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
       PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
@@ -284,8 +301,26 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
-          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --dir release-assets
-          if ($LASTEXITCODE -ne 0) { throw 'Could not download the staged release assets.' }
+          $releaseJson = @(& gh api "repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID" 2>&1)
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read the staged release.' }
+          $release = ($releaseJson -join "`n") | ConvertFrom-Json
+          if (-not $release.id -or -not $release.draft) { throw 'The staged release is not a draft.' }
+          $assets = @($release.assets)
+          if ($assets.Count -eq 0) { throw 'The staged release has no assets.' }
+          foreach ($asset in $assets) {
+            if ($asset.name -notmatch '^[A-Za-z0-9._-]+$') { throw 'A staged release asset name is invalid.' }
+            $destination = Join-Path (Get-Location) "release-assets/$($asset.name)"
+            try {
+              Invoke-WebRequest `
+                -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/assets/$($asset.id)" `
+                -Headers @{ Accept = 'application/octet-stream'; Authorization = "Bearer $env:GH_TOKEN" } `
+                -OutFile $destination `
+                -ErrorAction Stop | Out-Null
+            }
+            catch {
+              throw 'Could not download a staged release asset.'
+            }
+          }
           exit 0
 
       - name: Check exact asset set and generate SHA256SUMS
@@ -356,10 +391,10 @@ jobs:
       - name: Publish draft as latest release
         shell: pwsh
         run: |
-          $releaseJson = & gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:TAG" 2>$null
+          $releaseJson = & gh api "repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID" 2>$null
           if ($LASTEXITCODE -ne 0) { throw 'The staged release lookup failed.' }
           $release = $releaseJson | ConvertFrom-Json
-          if (-not $release.id) { throw 'The staged release could not be found.' }
+          if ($release.id -ne [int64]$env:RELEASE_ID -or -not $release.draft) { throw 'The staged release is not the expected draft.' }
           gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/releases/$($release.id)" `
             -F draft=false -F prerelease=false -f make_latest=true *> (Join-Path $env:RUNNER_TEMP 'publish-release.log')
           if ($LASTEXITCODE -ne 0) { throw 'Publishing the draft release failed.' }
@@ -412,11 +447,13 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ needs.plan.outputs.tag }}
+      RELEASE_ID: ${{ needs.stage.outputs.release_id }}
     steps:
       - name: Delete failed draft and tag
         shell: bash
         run: |
-          draft=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.draft' 2>/dev/null || true)
+          draft=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq '.draft' 2>/dev/null || true)
           if [ "$draft" = "true" ]; then
-            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag >/dev/null 2>&1 || true
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" >/dev/null 2>&1 || true
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" >/dev/null 2>&1 || true
           fi
