@@ -63,17 +63,29 @@ jobs:
           $lock = Get-Content -LiteralPath (Join-Path $env:MANAGER_DIR 'upstream.lock.json') -Raw | ConvertFrom-Json
           if ($lock.channel -ne 'stable') { throw 'The private lock is not on the stable channel.' }
           $identityLog = Join-Path $env:RUNNER_TEMP 'identity.log'
-          & pwsh -NoProfile -File (Join-Path $env:MANAGER_DIR 'scripts/get-build-identity.ps1') *> $identityLog
-          if ($LASTEXITCODE -ne 0) { throw 'Build identity planning failed; details are suppressed.' }
-          $identity = Get-Content -LiteralPath $identityLog -Raw | ConvertFrom-Json
-          $releaseLog = Join-Path $env:RUNNER_TEMP 'release-version.log'
-          & pwsh -NoProfile -File (Join-Path $env:MANAGER_DIR 'scripts/get-release-version.ps1') `
-            -Repository $env:GITHUB_REPOSITORY `
-            -Fingerprint $identity.fingerprint *> $releaseLog
-          if ($LASTEXITCODE -ne 0) { throw 'Release version planning failed; details are suppressed.' }
-          $release = Get-Content -LiteralPath $releaseLog -Raw | ConvertFrom-Json
-          "version=$($release.version)" >> $env:GITHUB_OUTPUT
-          "tag=$($release.tag)" >> $env:GITHUB_OUTPUT
+          Push-Location -LiteralPath $env:MANAGER_DIR
+          try {
+            & pwsh -NoProfile -File ./scripts/get-build-identity.ps1 *> $identityLog
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host 'DRY RUN ERROR CATEGORY: build-identity'
+              throw 'Build identity planning failed; details are suppressed.'
+            }
+            $identity = Get-Content -LiteralPath $identityLog -Raw | ConvertFrom-Json
+            $releaseLog = Join-Path $env:RUNNER_TEMP 'release-version.log'
+            & pwsh -NoProfile -File ./scripts/get-release-version.ps1 `
+              -Repository $env:GITHUB_REPOSITORY `
+              -Fingerprint $identity.fingerprint *> $releaseLog
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host 'DRY RUN ERROR CATEGORY: release-version'
+              throw 'Release version planning failed; details are suppressed.'
+            }
+            $release = Get-Content -LiteralPath $releaseLog -Raw | ConvertFrom-Json
+            "version=$($release.version)" >> $env:GITHUB_OUTPUT
+            "tag=$($release.tag)" >> $env:GITHUB_OUTPUT
+          }
+          finally {
+            Pop-Location
+          }
           Write-Host "DRY RUN ONLY: stable $($lock.stableTag) plans custom release $($release.tag)."
           Write-Host 'No release, tag, asset, checksum, or repository setting was created.'
 

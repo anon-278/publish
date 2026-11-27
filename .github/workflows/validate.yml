@@ -91,18 +91,30 @@ jobs:
           if ($lock.channel -ne 'stable') { throw 'The private checkout is not on the stable channel.' }
 
           $identityLog = Join-Path $env:RUNNER_TEMP 'identity.log'
-          & pwsh -NoProfile -File (Join-Path $env:MANAGER_DIR 'scripts/get-build-identity.ps1') *> $identityLog
-          if ($LASTEXITCODE -ne 0) { throw 'Build identity planning failed; details are suppressed.' }
-          $identity = Get-Content -LiteralPath $identityLog -Raw | ConvertFrom-Json
+          Push-Location -LiteralPath $env:MANAGER_DIR
+          try {
+            & pwsh -NoProfile -File ./scripts/get-build-identity.ps1 *> $identityLog
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host 'DRY RUN ERROR CATEGORY: build-identity'
+              throw 'Build identity planning failed; details are suppressed.'
+            }
+            $identity = Get-Content -LiteralPath $identityLog -Raw | ConvertFrom-Json
 
-          $releaseLog = Join-Path $env:RUNNER_TEMP 'release-version.log'
-          & pwsh -NoProfile -File (Join-Path $env:MANAGER_DIR 'scripts/get-release-version.ps1') `
-            -Repository $env:GITHUB_REPOSITORY `
-            -Fingerprint $identity.fingerprint *> $releaseLog
-          if ($LASTEXITCODE -ne 0) { throw 'Release version planning failed; details are suppressed.' }
-          $release = Get-Content -LiteralPath $releaseLog -Raw | ConvertFrom-Json
-          "version=$($release.version)" >> $env:GITHUB_OUTPUT
-          "tag=$($release.tag)" >> $env:GITHUB_OUTPUT
+            $releaseLog = Join-Path $env:RUNNER_TEMP 'release-version.log'
+            & pwsh -NoProfile -File ./scripts/get-release-version.ps1 `
+              -Repository $env:GITHUB_REPOSITORY `
+              -Fingerprint $identity.fingerprint *> $releaseLog
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host 'DRY RUN ERROR CATEGORY: release-version'
+              throw 'Release version planning failed; details are suppressed.'
+            }
+            $release = Get-Content -LiteralPath $releaseLog -Raw | ConvertFrom-Json
+            "version=$($release.version)" >> $env:GITHUB_OUTPUT
+            "tag=$($release.tag)" >> $env:GITHUB_OUTPUT
+          }
+          finally {
+            Pop-Location
+          }
           Write-Host "DRY RUN ONLY: PR #${{ steps.pr.outputs.pr_number }} at ${{ steps.pr.outputs.head_sha }} plans $($release.tag)."
 
   package:
@@ -172,16 +184,28 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $identityLog = Join-Path $env:RUNNER_TEMP 'identity.log'
-          & pwsh -NoProfile -File (Join-Path $env:MANAGER_DIR 'scripts/get-build-identity.ps1') *> $identityLog
-          if ($LASTEXITCODE -ne 0) { throw 'Build identity planning failed; details are suppressed.' }
-          $identity = Get-Content -LiteralPath $identityLog -Raw | ConvertFrom-Json
-          $releaseLog = Join-Path $env:RUNNER_TEMP 'release-version.log'
-          & pwsh -NoProfile -File (Join-Path $env:MANAGER_DIR 'scripts/get-release-version.ps1') `
-            -Repository $env:GITHUB_REPOSITORY `
-            -Fingerprint $identity.fingerprint *> $releaseLog
-          if ($LASTEXITCODE -ne 0) { throw 'Release version planning failed; details are suppressed.' }
-          $release = Get-Content -LiteralPath $releaseLog -Raw | ConvertFrom-Json
-          "VERSION=$($release.version)" >> $env:GITHUB_ENV
+          Push-Location -LiteralPath $env:MANAGER_DIR
+          try {
+            & pwsh -NoProfile -File ./scripts/get-build-identity.ps1 *> $identityLog
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host 'DRY RUN ERROR CATEGORY: build-identity'
+              throw 'Build identity planning failed; details are suppressed.'
+            }
+            $identity = Get-Content -LiteralPath $identityLog -Raw | ConvertFrom-Json
+            $releaseLog = Join-Path $env:RUNNER_TEMP 'release-version.log'
+            & pwsh -NoProfile -File ./scripts/get-release-version.ps1 `
+              -Repository $env:GITHUB_REPOSITORY `
+              -Fingerprint $identity.fingerprint *> $releaseLog
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host 'DRY RUN ERROR CATEGORY: release-version'
+              throw 'Release version planning failed; details are suppressed.'
+            }
+            $release = Get-Content -LiteralPath $releaseLog -Raw | ConvertFrom-Json
+            "VERSION=$($release.version)" >> $env:GITHUB_ENV
+          }
+          finally {
+            Pop-Location
+          }
 
       - name: Apply patch series with suppressed output
         shell: pwsh
