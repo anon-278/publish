@@ -1,17 +1,23 @@
-name: Validate private pull request (dry run)
+name: Validate private pull requests
+
+# The public repository cannot receive private-repository PR events.
+# Polling and repository_dispatch keep the trigger surface explicit while the
+# commit statuses below give auto-merge an exact head-SHA gate.
 
 on:
+  schedule:
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       pr_number:
-        description: Private pull request number to inspect
-        required: true
-        default: '38'
+        description: Private pull request number, or all open pull requests
+        required: false
+        default: all
         type: string
       full_build:
-        description: Run the Windows and Linux package builds after the privacy preflight
+        description: Run the Windows and Linux package builds
         required: true
-        default: false
+        default: true
         type: boolean
   repository_dispatch:
     types: [validate]
@@ -20,141 +26,138 @@ permissions:
   contents: read
 
 concurrency:
-  group: public-dry-validate
+  group: public-validate
   cancel-in-progress: true
 
 jobs:
-  preflight:
-    name: Private checkout and validation plan
+  select:
+    name: Select private pull requests
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      head_sha: ${{ steps.pr.outputs.head_sha }}
-      version: ${{ steps.plan.outputs.version }}
-      tag: ${{ steps.plan.outputs.tag }}
+      targets: ${{ steps.select.outputs.targets }}
+      has_targets: ${{ steps.select.outputs.has_targets }}
+      full_build: ${{ steps.select.outputs.full_build }}
     steps:
       - name: Checkout public workflow repository
         uses: actions/checkout@v4
 
-      - name: Read private pull request metadata
-        id: pr
+      - name: Poll open private pull requests
+        id: select
         shell: pwsh
         env:
           PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
           PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
           PRIVATE_REPO_READ_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
-          PR_NUMBER: ${{ inputs.pr_number || github.event.client_payload.pr_number || '38' }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.client_payload.pr_number || 'all' }}
+          FULL_BUILD_INPUT: ${{ inputs.full_build }}
+          DISPATCH_FULL_BUILD: ${{ github.event.client_payload.full_build }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          $json = pwsh -NoProfile -File ./scripts/read-private-pr.ps1 `
-            -Owner $env:PRIVATE_REPO_OWNER `
-            -Name $env:PRIVATE_REPO_NAME `
-            -Token $env:PRIVATE_REPO_READ_TOKEN `
-            -Number ([int]$env:PR_NUMBER)
-          if ($LASTEXITCODE -ne 0) { throw 'Could not read the private pull request.' }
-          $pr = $json | ConvertFrom-Json
-          if ($pr.baseRef -ne 'master') { throw 'The private pull request does not target the expected base branch.' }
-          if ($pr.crossRepository) { throw 'Cross-repository pull requests are not eligible for this dry run.' }
-          "head_sha=$($pr.headSha)" >> $env:GITHUB_OUTPUT
-          "pr_number=$($pr.number)" >> $env:GITHUB_OUTPUT
-          "draft=$($pr.draft.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
-
-      - name: Clone exact private pull request head
-        shell: pwsh
-        env:
-          PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
-          PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
-          PRIVATE_REPO_READ_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
-          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
-          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          MANAGER_DIR: ${{ runner.temp }}/private-manager
-        run: |
-          pwsh -NoProfile -File ./scripts/secure-clone.ps1 `
-            -Owner $env:PRIVATE_REPO_OWNER `
-            -Name $env:PRIVATE_REPO_NAME `
-            -Token $env:PRIVATE_REPO_READ_TOKEN `
-            -Destination $env:MANAGER_DIR `
-            -PullNumber ([int]$env:PR_NUMBER) `
-            -Revision $env:HEAD_SHA
-          if ($LASTEXITCODE -ne 0) { throw 'Could not clone the private pull request.' }
-          "MANAGER_DIR=$env:MANAGER_DIR" >> $env:GITHUB_ENV
-
-      - name: Plan stable version without publishing
-        id: plan
-        shell: pwsh
-        env:
-          MANAGER_DIR: ${{ runner.temp }}/private-manager
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $lockPath = Join-Path $env:MANAGER_DIR 'upstream.lock.json'
-          if (-not (Test-Path -LiteralPath $lockPath)) { throw 'The private checkout has no upstream lock.' }
-          $lock = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
-          if ($lock.channel -ne 'stable') { throw 'The private checkout is not on the stable channel.' }
-
-          $identityLog = Join-Path $env:RUNNER_TEMP 'identity.log'
-          Push-Location -LiteralPath $env:MANAGER_DIR
-          try {
-            & pwsh -NoProfile -File ./scripts/get-build-identity.ps1 *> $identityLog
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host 'DRY RUN ERROR CATEGORY: build-identity'
-              throw 'Build identity planning failed; details are suppressed.'
-            }
-            $identity = Get-Content -LiteralPath $identityLog -Raw | ConvertFrom-Json
-
-            $releaseLog = Join-Path $env:RUNNER_TEMP 'release-version.log'
-            & pwsh -NoProfile -File ./scripts/get-release-version.ps1 `
-              -Repository $env:GITHUB_REPOSITORY `
-              -Fingerprint $identity.fingerprint *> $releaseLog
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host 'DRY RUN ERROR CATEGORY: release-version'
-              throw 'Release version planning failed; details are suppressed.'
-            }
-            $release = Get-Content -LiteralPath $releaseLog -Raw | ConvertFrom-Json
-            "version=$($release.version)" >> $env:GITHUB_OUTPUT
-            "tag=$($release.tag)" >> $env:GITHUB_OUTPUT
+          $repo = "$env:PRIVATE_REPO_OWNER/$env:PRIVATE_REPO_NAME"
+          Write-Output "::add-mask::$repo"
+          Write-Output "::add-mask::https://github.com/$repo"
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:PRIVATE_REPO_READ_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
           }
-          finally {
-            Pop-Location
+          function Get-PrivateApi([string] $Path) {
+            try {
+              return Invoke-RestMethod -Method Get -Uri "https://api.github.com/repos/$repo/$Path" -Headers $headers -ErrorAction Stop
+            }
+            catch {
+              throw 'Private pull request polling failed; details are suppressed.'
+            }
           }
-          Write-Host "DRY RUN ONLY: PR #${{ steps.pr.outputs.pr_number }} at ${{ steps.pr.outputs.head_sha }} plans $($release.tag)."
 
-  package:
-    name: Full dry-run package (${{ matrix.platform }})
-    needs: preflight
-    if: github.event_name == 'workflow_dispatch' && inputs.full_build == true
+          $requested = $env:PR_NUMBER.Trim()
+          if ($requested -eq 'all' -or -not $requested) {
+            $pulls = @(Get-PrivateApi 'pulls?state=open&base=master&per_page=100')
+          }
+          else {
+            if ($requested -notmatch '^\d+$' -or [int]$requested -lt 1) { throw 'The requested pull request number is invalid.' }
+            $pulls = @(Get-PrivateApi "pulls/$requested")
+          }
+
+          $selected = @(
+            $pulls | Where-Object {
+              $_.state -eq 'open' -and
+              $_.base.ref -eq 'master' -and
+              $_.head.repo.full_name -eq $repo
+            }
+          )
+          if ($requested -ne 'all' -and $selected.Count -eq 0) {
+            throw 'The requested pull request is not an eligible open same-repository PR.'
+          }
+
+          $rawFullBuild = if ($env:EVENT_NAME -eq 'schedule') { 'true' } elseif ($env:FULL_BUILD_INPUT) { $env:FULL_BUILD_INPUT } elseif ($env:DISPATCH_FULL_BUILD) { $env:DISPATCH_FULL_BUILD } else { 'true' }
+          $fullBuild = $rawFullBuild -match '^(?i:true|1|yes)$'
+          $targets = foreach ($pr in $selected) {
+            $platforms = if ($fullBuild) { @('windows', 'linux') } else { @('windows') }
+            foreach ($platform in $platforms) {
+              [ordered]@{
+                number = [int]$pr.number
+                head_sha = [string]$pr.head.sha
+                platform = $platform
+              }
+            }
+          }
+          $targets = @($targets)
+          $hasTargets = $targets.Count -gt 0
+          if (-not $hasTargets) {
+            # Keep the matrix syntactically valid; the job-level gate skips it.
+            $targets = @([ordered]@{ number = 0; head_sha = ''; platform = 'none' })
+          }
+          "targets=$(@($targets) | ConvertTo-Json -Compress -Depth 4)" >> $env:GITHUB_OUTPUT
+          "has_targets=$($hasTargets.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "full_build=$($fullBuild.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          Write-Host "Selected $($selected.Count) eligible private pull request(s); full_build=$fullBuild."
+
+  validate:
+    name: "Validate PR #${{ matrix.number }} (${{ matrix.platform }})"
+    needs: select
+    if: needs.select.outputs.has_targets == 'true'
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
-        include:
-          - platform: windows
-            runner: windows-latest
-          - platform: linux
-            # Upstream Linux native modules require the Ubuntu 24.04 glibc ceiling.
-            runner: ubuntu-24.04
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+        include: ${{ fromJSON(needs.select.outputs.targets) }}
+    runs-on: ${{ matrix.platform == 'linux' && 'ubuntu-24.04' || 'windows-latest' }}
+    timeout-minutes: 50
     steps:
       - name: Checkout public workflow repository
         uses: actions/checkout@v4
 
-      - name: Read private pull request metadata
-        id: pr
+      - name: Report validation pending
         shell: pwsh
         env:
           PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
           PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
-          PRIVATE_REPO_READ_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
-          PR_NUMBER: ${{ inputs.pr_number || github.event.client_payload.pr_number || '38' }}
+          PRIVATE_REPO_DISCOVER_TOKEN: ${{ secrets.PRIVATE_REPO_DISCOVER_TOKEN }}
+          HEAD_SHA: ${{ matrix.head_sha }}
+          PLATFORM: ${{ matrix.platform }}
+          FULL_BUILD: ${{ needs.select.outputs.full_build }}
         run: |
-          $json = pwsh -NoProfile -File ./scripts/read-private-pr.ps1 `
-            -Owner $env:PRIVATE_REPO_OWNER `
-            -Name $env:PRIVATE_REPO_NAME `
-            -Token $env:PRIVATE_REPO_READ_TOKEN `
-            -Number ([int]$env:PR_NUMBER)
-          if ($LASTEXITCODE -ne 0) { throw 'Could not read the private pull request.' }
-          $pr = $json | ConvertFrom-Json
-          if ($pr.baseRef -ne 'master' -or $pr.crossRepository) { throw 'The pull request is not eligible for this dry run.' }
-          "head_sha=$($pr.headSha)" >> $env:GITHUB_OUTPUT
-          "pr_number=$($pr.number)" >> $env:GITHUB_OUTPUT
+          $repo = "$env:PRIVATE_REPO_OWNER/$env:PRIVATE_REPO_NAME"
+          Write-Output "::add-mask::$repo"
+          $context = if ($env:FULL_BUILD -eq 'true') { "custom-validate/$env:PLATFORM" } else { "custom-preflight/$env:PLATFORM" }
+          $body = [ordered]@{
+            state = 'pending'
+            target_url = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            description = 'Validation started.'
+            context = $context
+          } | ConvertTo-Json -Compress
+          try {
+            Invoke-RestMethod -Method Post `
+              -Uri "https://api.github.com/repos/$repo/statuses/$env:HEAD_SHA" `
+              -Headers @{ Accept = 'application/vnd.github+json'; Authorization = "Bearer $env:PRIVATE_REPO_DISCOVER_TOKEN"; 'X-GitHub-Api-Version' = '2022-11-28' } `
+              -ContentType 'application/json' -Body $body -ErrorAction Stop | Out-Null
+          }
+          catch {
+            Write-Host 'LIVE VALIDATE ERROR CATEGORY: status-pending'
+            throw 'Could not report validation status; details are suppressed.'
+          }
 
       - name: Clone exact private pull request head
         shell: pwsh
@@ -162,8 +165,8 @@ jobs:
           PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
           PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
           PRIVATE_REPO_READ_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
-          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
-          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          PR_NUMBER: ${{ matrix.number }}
+          HEAD_SHA: ${{ matrix.head_sha }}
           MANAGER_DIR: ${{ runner.temp }}/private-manager
           SOURCE_DIR: ${{ runner.temp }}/upstream-source
         run: |
@@ -192,27 +195,29 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu
 
-      - name: Plan dry-run version
+      - name: Plan release version
         shell: pwsh
         env:
           MANAGER_DIR: ${{ runner.temp }}/private-manager
+          RELEASE_REPO: ${{ vars.RELEASE_REPO }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          if ($env:RELEASE_REPO -notmatch '^[^/\s]+/[^/\s]+$') { throw 'The public release repository is not configured.' }
           $identityLog = Join-Path $env:RUNNER_TEMP 'identity.log'
           Push-Location -LiteralPath $env:MANAGER_DIR
           try {
             & pwsh -NoProfile -File ./scripts/get-build-identity.ps1 *> $identityLog
             if ($LASTEXITCODE -ne 0) {
-              Write-Host 'DRY RUN ERROR CATEGORY: build-identity'
+              Write-Host 'LIVE VALIDATE ERROR CATEGORY: build-identity'
               throw 'Build identity planning failed; details are suppressed.'
             }
             $identity = Get-Content -LiteralPath $identityLog -Raw | ConvertFrom-Json
             $releaseLog = Join-Path $env:RUNNER_TEMP 'release-version.log'
             & pwsh -NoProfile -File ./scripts/get-release-version.ps1 `
-              -Repository $env:GITHUB_REPOSITORY `
+              -Repository $env:RELEASE_REPO `
               -Fingerprint $identity.fingerprint *> $releaseLog
             if ($LASTEXITCODE -ne 0) {
-              Write-Host 'DRY RUN ERROR CATEGORY: release-version'
+              Write-Host 'LIVE VALIDATE ERROR CATEGORY: release-version'
               throw 'Release version planning failed; details are suppressed.'
             }
             $release = Get-Content -LiteralPath $releaseLog -Raw | ConvertFrom-Json
@@ -222,35 +227,61 @@ jobs:
             Pop-Location
           }
 
-      - name: Apply patch series with suppressed output
+      - name: Run privacy-safe validation and package
         shell: pwsh
         env:
           MANAGER_DIR: ${{ runner.temp }}/private-manager
           SOURCE_DIR: ${{ runner.temp }}/upstream-source
+          PLATFORM: ${{ matrix.platform }}
+          FULL_BUILD: ${{ needs.select.outputs.full_build }}
+          RELEASE_REPO: ${{ vars.RELEASE_REPO }}
         run: |
-          $log = Join-Path $env:RUNNER_TEMP 'apply-patches.log'
-          & pwsh -NoProfile -File (Join-Path $env:MANAGER_DIR 'scripts/apply-patches.ps1') -SourceDir $env:SOURCE_DIR *> $log
-          if ($LASTEXITCODE -ne 0) { throw 'Patch application failed; details are suppressed.' }
+          $args = @(
+            '-NoProfile', '-File', './scripts/dry-run-build.ps1',
+            '-ManagerDir', $env:MANAGER_DIR,
+            '-SourceDir', $env:SOURCE_DIR,
+            '-Platform', $env:PLATFORM,
+            '-Version', $env:VERSION,
+            '-Repository', $env:RELEASE_REPO
+          )
+          if ($env:FULL_BUILD -eq 'true') { $args += '-FullBuild' }
+          & pwsh @args
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "LIVE VALIDATE ERROR CATEGORY: build-$env:PLATFORM"
+            throw 'Validation or packaging failed; details are suppressed.'
+          }
 
-      - name: Set up Vite+
-        uses: voidzero-dev/setup-vp@v1.21.2
-        with:
-          working-directory: ${{ runner.temp }}/upstream-source
-          node-version-file: ${{ runner.temp }}/upstream-source/package.json
-          cache: false
-          run-install: false
-
-      - name: Run local dry-run build
+      - name: Report validation result
+        if: always()
         shell: pwsh
         env:
-          MANAGER_DIR: ${{ runner.temp }}/private-manager
-          SOURCE_DIR: ${{ runner.temp }}/upstream-source
+          PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
+          PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
+          PRIVATE_REPO_DISCOVER_TOKEN: ${{ secrets.PRIVATE_REPO_DISCOVER_TOKEN }}
+          HEAD_SHA: ${{ matrix.head_sha }}
+          PLATFORM: ${{ matrix.platform }}
+          FULL_BUILD: ${{ needs.select.outputs.full_build }}
+          JOB_STATUS: ${{ job.status }}
         run: |
-          pwsh -NoProfile -File ./scripts/dry-run-build.ps1 `
-            -ManagerDir $env:MANAGER_DIR `
-            -SourceDir $env:SOURCE_DIR `
-            -Platform '${{ matrix.platform }}' `
-            -Version $env:VERSION `
-            -Repository $env:GITHUB_REPOSITORY `
-            -FullBuild `
-            -SkipApply
+          $repo = "$env:PRIVATE_REPO_OWNER/$env:PRIVATE_REPO_NAME"
+          Write-Output "::add-mask::$repo"
+          $context = if ($env:FULL_BUILD -eq 'true') { "custom-validate/$env:PLATFORM" } else { "custom-preflight/$env:PLATFORM" }
+          $state = if ($env:JOB_STATUS -eq 'success') { 'success' } else { 'failure' }
+          $description = if ($state -eq 'success') { 'Validation and packaging passed.' } else { 'Validation or packaging failed.' }
+          $body = [ordered]@{
+            state = $state
+            target_url = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            description = $description
+            context = $context
+          } | ConvertTo-Json -Compress
+          try {
+            Invoke-RestMethod -Method Post `
+              -Uri "https://api.github.com/repos/$repo/statuses/$env:HEAD_SHA" `
+              -Headers @{ Accept = 'application/vnd.github+json'; Authorization = "Bearer $env:PRIVATE_REPO_DISCOVER_TOKEN"; 'X-GitHub-Api-Version' = '2022-11-28' } `
+              -ContentType 'application/json' -Body $body -ErrorAction Stop | Out-Null
+          }
+          catch {
+            Write-Host 'LIVE VALIDATE ERROR CATEGORY: status-result'
+            throw 'Could not report final validation status; details are suppressed.'
+          }
+          exit 0
