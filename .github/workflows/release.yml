@@ -15,8 +15,6 @@ on:
         type: boolean
   repository_dispatch:
     types: [release]
-  schedule:
-    - cron: '53 */4 * * *'
 
 permissions:
   contents: read

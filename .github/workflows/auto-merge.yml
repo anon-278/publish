@@ -10,8 +10,6 @@ on:
         type: string
   repository_dispatch:
     types: [auto-merge]
-  schedule:
-    - cron: '41 */2 * * *'
 
 permissions:
   contents: read
