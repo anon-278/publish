@@ -56,7 +56,10 @@ jobs:
             -Branch $env:SOURCE_REF
           if ($LASTEXITCODE -ne 0) { throw 'Could not clone the merged private stable ref.' }
           "MANAGER_DIR=$env:MANAGER_DIR" >> $env:GITHUB_ENV
-          "source_sha=$((git -C $env:MANAGER_DIR rev-parse HEAD).Trim())" >> $env:GITHUB_OUTPUT
+          $sourceSha = (& git -C $env:MANAGER_DIR rev-parse HEAD 2>$null).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $sourceSha) { throw 'Could not identify the merged private source.' }
+          "source_sha=$sourceSha" >> $env:GITHUB_OUTPUT
+          exit 0
 
       - name: Plan next custom stable version and guard the tag
         id: plan
@@ -98,11 +101,15 @@ jobs:
             throw 'This build fingerprint is already published.'
           }
 
-          $tagLog = Join-Path $env:RUNNER_TEMP 'tag-check.log'
-          & gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$($release.tag)" *> $tagLog
-          if ($LASTEXITCODE -eq 0) {
+          $tagResult = @(& gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$($release.tag)" 2>&1)
+          $tagStatus = $LASTEXITCODE
+          if ($tagStatus -eq 0) {
             Write-Host 'LIVE RELEASE ERROR CATEGORY: tag-exists'
             throw 'The release tag already exists.'
+          }
+          if (($tagResult -join "`n") -notmatch '(?i)404|not found') {
+            Write-Host 'LIVE RELEASE ERROR CATEGORY: tag-check'
+            throw 'The release tag guard could not determine whether the tag exists.'
           }
 
           "version=$($release.version)" >> $env:GITHUB_OUTPUT
@@ -111,6 +118,8 @@ jobs:
           "upstream_tag=$($lock.stableTag)" >> $env:GITHUB_OUTPUT
           "upstream_commit=$($lock.commit)" >> $env:GITHUB_OUTPUT
           Write-Host "Planned live release $($release.tag) from stable $($lock.stableTag)."
+          $LASTEXITCODE = 0
+          exit 0
 
   stage:
     name: Create draft release
@@ -141,6 +150,7 @@ jobs:
           ) -join "`n"
           gh release create $env:TAG --repo $env:GITHUB_REPOSITORY --title "T3 Code $env:VERSION" --notes $notes --draft
           if ($LASTEXITCODE -ne 0) { throw 'Draft release creation failed.' }
+          exit 0
 
   build:
     name: Build and upload ${{ matrix.platform }} assets
@@ -181,6 +191,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Could not clone the merged private stable ref.' }
           "MANAGER_DIR=$env:MANAGER_DIR" >> $env:GITHUB_ENV
           "SOURCE_DIR=$env:SOURCE_DIR" >> $env:GITHUB_ENV
+          exit 0
 
       - name: Install Linux desktop build libraries
         if: matrix.platform == 'linux'
@@ -208,6 +219,7 @@ jobs:
             Write-Host 'LIVE RELEASE ERROR CATEGORY: apply-patches'
             throw 'Patch application failed; details are suppressed.'
           }
+          exit 0
 
       - name: Set up Vite+
         uses: voidzero-dev/setup-vp@v1.21.2
@@ -234,6 +246,7 @@ jobs:
             -Repository $env:REPOSITORY `
             -SkipApply
           if ($LASTEXITCODE -ne 0) { throw 'Live platform build failed; details are suppressed.' }
+          exit 0
 
       - name: Upload assets to draft release
         shell: pwsh
@@ -246,6 +259,7 @@ jobs:
           if ($files.Count -eq 0) { throw 'No platform assets were collected.' }
           & gh release upload $env:TAG @files --repo $env:GITHUB_REPOSITORY --clobber
           if ($LASTEXITCODE -ne 0) { throw 'Draft asset upload failed.' }
+          exit 0
 
   finalize:
     name: Verify and publish release
@@ -272,6 +286,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
           gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --dir release-assets
           if ($LASTEXITCODE -ne 0) { throw 'Could not download the staged release assets.' }
+          exit 0
 
       - name: Check exact asset set and generate SHA256SUMS
         shell: pwsh
@@ -297,6 +312,7 @@ jobs:
             "$hash  $($file.Name)"
           }
           [System.IO.File]::WriteAllText((Join-Path (Get-Location) 'release-assets/SHA256SUMS'), (($lines -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
+          exit 0
 
       - name: Clone private validation scripts
         shell: pwsh
@@ -310,6 +326,7 @@ jobs:
             -Destination $env:MANAGER_DIR `
             -Branch master
           if ($LASTEXITCODE -ne 0) { throw 'Could not clone private validation scripts.' }
+          exit 0
 
       - name: Verify release assets and checksums
         shell: pwsh
@@ -327,15 +344,19 @@ jobs:
             Write-Host 'LIVE RELEASE ERROR CATEGORY: asset-validation'
             throw 'Release asset validation failed; details are suppressed.'
           }
+          exit 0
 
       - name: Publish draft as latest release
         shell: pwsh
         run: |
-          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:TAG" | ConvertFrom-Json
+          $releaseJson = & gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:TAG" 2>$null
+          if ($LASTEXITCODE -ne 0) { throw 'The staged release lookup failed.' }
+          $release = $releaseJson | ConvertFrom-Json
           if (-not $release.id) { throw 'The staged release could not be found.' }
           gh api --method PATCH "repos/$env:GITHUB_REPOSITORY/releases/$($release.id)" `
             -F draft=false -F prerelease=false -f make_latest=true *> (Join-Path $env:RUNNER_TEMP 'publish-release.log')
           if ($LASTEXITCODE -ne 0) { throw 'Publishing the draft release failed.' }
+          exit 0
 
       - name: Verify published release anonymously
         shell: pwsh
@@ -371,6 +392,7 @@ jobs:
               Start-Sleep -Seconds 10
             }
           }
+          exit 0
 
   cleanup:
     name: Remove failed draft release
