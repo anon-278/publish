@@ -323,7 +323,7 @@ jobs:
 
   finalize:
     name: Verify and publish release
-    needs: [plan, build]
+    needs: [plan, stage, build]
     if: needs.build.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 20
