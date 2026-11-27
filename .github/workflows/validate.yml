@@ -48,6 +48,7 @@ jobs:
           PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
           PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
           PRIVATE_REPO_READ_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          PRIVATE_REPO_MERGE_TOKEN: ${{ secrets.PRIVATE_REPO_MERGE_TOKEN }}
           PR_NUMBER: ${{ inputs.pr_number || github.event.client_payload.pr_number || 'all' }}
           FULL_BUILD_INPUT: ${{ inputs.full_build }}
           DISPATCH_FULL_BUILD: ${{ github.event.client_payload.full_build }}
@@ -76,7 +77,7 @@ jobs:
             }
           }
 
-          $requested = $env:PR_NUMBER.Trim()
+          $requested = if ([string]::IsNullOrWhiteSpace($env:PR_NUMBER)) { 'all' } else { $env:PR_NUMBER.Trim() }
           if ($requested -eq 'all' -or -not $requested) {
             $pulls = @(Get-PrivateApi $env:PRIVATE_REPO_OWNER $env:PRIVATE_REPO_NAME $env:PRIVATE_REPO_READ_TOKEN 'pulls?state=open&base=master&per_page=100')
           }
@@ -101,7 +102,7 @@ jobs:
           $targets = foreach ($pr in $selected) {
             $alreadyValidated = $false
             if ($allowFullBuild) {
-              $status = Get-PrivateApi $env:PRIVATE_REPO_OWNER $env:PRIVATE_REPO_NAME $env:PRIVATE_REPO_READ_TOKEN "commits/$($pr.head.sha)/status"
+              $status = Get-PrivateApi $env:PRIVATE_REPO_OWNER $env:PRIVATE_REPO_NAME $env:PRIVATE_REPO_MERGE_TOKEN "commits/$($pr.head.sha)/status"
               $alreadyValidated = $true
               foreach ($context in @('custom-validate/windows', 'custom-validate/linux')) {
                 $latest = @(
