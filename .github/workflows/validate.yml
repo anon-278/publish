@@ -37,7 +37,6 @@ jobs:
     outputs:
       targets: ${{ steps.select.outputs.targets }}
       has_targets: ${{ steps.select.outputs.has_targets }}
-      full_build: ${{ steps.select.outputs.full_build }}
     steps:
       - name: Checkout public workflow repository
         uses: actions/checkout@v4
@@ -92,14 +91,34 @@ jobs:
           }
 
           $rawFullBuild = if ($env:EVENT_NAME -eq 'schedule') { 'true' } elseif ($env:FULL_BUILD_INPUT) { $env:FULL_BUILD_INPUT } elseif ($env:DISPATCH_FULL_BUILD) { $env:DISPATCH_FULL_BUILD } else { 'true' }
-          $fullBuild = $rawFullBuild -match '^(?i:true|1|yes)$'
+          $allowFullBuild = $rawFullBuild -match '^(?i:true|1|yes)$'
           $targets = foreach ($pr in $selected) {
-            $platforms = if ($fullBuild) { @('windows', 'linux') } else { @('windows') }
+            $alreadyValidated = $false
+            if ($allowFullBuild) {
+              $status = Get-PrivateApi "commits/$($pr.head.sha)/status"
+              $alreadyValidated = $true
+              foreach ($context in @('custom-validate/windows', 'custom-validate/linux')) {
+                $latest = @(
+                  $status.statuses |
+                    Where-Object { $_.context -eq $context } |
+                    Sort-Object { [DateTimeOffset]$_.updated_at } -Descending |
+                    Select-Object -First 1
+                )
+                if ($latest.Count -eq 0 -or $latest[0].state -ne 'success') {
+                  $alreadyValidated = $false
+                  break
+                }
+              }
+            }
+            if ($allowFullBuild -and $alreadyValidated) { continue }
+            $runFullBuild = $allowFullBuild
+            $platforms = if ($runFullBuild) { @('windows', 'linux') } else { @('windows') }
             foreach ($platform in $platforms) {
               [ordered]@{
                 number = [int]$pr.number
                 head_sha = [string]$pr.head.sha
                 platform = $platform
+                full_build = $runFullBuild
               }
             }
           }
@@ -111,8 +130,7 @@ jobs:
           }
           "targets=$(@($targets) | ConvertTo-Json -Compress -Depth 4)" >> $env:GITHUB_OUTPUT
           "has_targets=$($hasTargets.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
-          "full_build=$($fullBuild.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
-          Write-Host "Selected $($selected.Count) eligible private pull request(s); full_build=$fullBuild."
+          Write-Host "Selected $($selected.Count) eligible private pull request(s); unvalidated full builds are enabled=$allowFullBuild."
 
   validate:
     name: "Validate PR #${{ matrix.number }} (${{ matrix.platform }})"
@@ -134,10 +152,10 @@ jobs:
         env:
           PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
           PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
-          PRIVATE_REPO_DISCOVER_TOKEN: ${{ secrets.PRIVATE_REPO_DISCOVER_TOKEN }}
+          PRIVATE_REPO_MERGE_TOKEN: ${{ secrets.PRIVATE_REPO_MERGE_TOKEN }}
           HEAD_SHA: ${{ matrix.head_sha }}
           PLATFORM: ${{ matrix.platform }}
-          FULL_BUILD: ${{ needs.select.outputs.full_build }}
+          FULL_BUILD: ${{ matrix.full_build }}
         run: |
           $repo = "$env:PRIVATE_REPO_OWNER/$env:PRIVATE_REPO_NAME"
           Write-Output "::add-mask::$repo"
@@ -151,7 +169,7 @@ jobs:
           try {
             Invoke-RestMethod -Method Post `
               -Uri "https://api.github.com/repos/$repo/statuses/$env:HEAD_SHA" `
-              -Headers @{ Accept = 'application/vnd.github+json'; Authorization = "Bearer $env:PRIVATE_REPO_DISCOVER_TOKEN"; 'X-GitHub-Api-Version' = '2022-11-28' } `
+              -Headers @{ Accept = 'application/vnd.github+json'; Authorization = "Bearer $env:PRIVATE_REPO_MERGE_TOKEN"; 'X-GitHub-Api-Version' = '2022-11-28' } `
               -ContentType 'application/json' -Body $body -ErrorAction Stop | Out-Null
           }
           catch {
@@ -233,7 +251,7 @@ jobs:
           MANAGER_DIR: ${{ runner.temp }}/private-manager
           SOURCE_DIR: ${{ runner.temp }}/upstream-source
           PLATFORM: ${{ matrix.platform }}
-          FULL_BUILD: ${{ needs.select.outputs.full_build }}
+          FULL_BUILD: ${{ matrix.full_build }}
           RELEASE_REPO: ${{ vars.RELEASE_REPO }}
         run: |
           $args = @(
@@ -257,10 +275,10 @@ jobs:
         env:
           PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
           PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
-          PRIVATE_REPO_DISCOVER_TOKEN: ${{ secrets.PRIVATE_REPO_DISCOVER_TOKEN }}
+          PRIVATE_REPO_MERGE_TOKEN: ${{ secrets.PRIVATE_REPO_MERGE_TOKEN }}
           HEAD_SHA: ${{ matrix.head_sha }}
           PLATFORM: ${{ matrix.platform }}
-          FULL_BUILD: ${{ needs.select.outputs.full_build }}
+          FULL_BUILD: ${{ matrix.full_build }}
           JOB_STATUS: ${{ job.status }}
         run: |
           $repo = "$env:PRIVATE_REPO_OWNER/$env:PRIVATE_REPO_NAME"
@@ -277,7 +295,7 @@ jobs:
           try {
             Invoke-RestMethod -Method Post `
               -Uri "https://api.github.com/repos/$repo/statuses/$env:HEAD_SHA" `
-              -Headers @{ Accept = 'application/vnd.github+json'; Authorization = "Bearer $env:PRIVATE_REPO_DISCOVER_TOKEN"; 'X-GitHub-Api-Version' = '2022-11-28' } `
+              -Headers @{ Accept = 'application/vnd.github+json'; Authorization = "Bearer $env:PRIVATE_REPO_MERGE_TOKEN"; 'X-GitHub-Api-Version' = '2022-11-28' } `
               -ContentType 'application/json' -Body $body -ErrorAction Stop | Out-Null
           }
           catch {
