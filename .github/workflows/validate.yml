@@ -252,6 +252,30 @@ jobs:
             Pop-Location
           }
 
+      - name: Set up Vite+
+        uses: voidzero-dev/setup-vp@v1.21.2
+        with:
+          working-directory: ${{ runner.temp }}/upstream-source
+          node-version-file: ${{ runner.temp }}/upstream-source/package.json
+          cache: false
+          run-install: false
+
+      - name: Apply patch series with suppressed output
+        shell: pwsh
+        env:
+          MANAGER_DIR: ${{ runner.temp }}/private-manager
+          SOURCE_DIR: ${{ runner.temp }}/upstream-source
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'apply-patches.log'
+          try {
+            & pwsh -NoProfile -File (Join-Path $env:MANAGER_DIR 'scripts/apply-patches.ps1') -SourceDir $env:SOURCE_DIR *> $log
+            if ($LASTEXITCODE -ne 0) { throw 'apply-patches failed' }
+          }
+          catch {
+            Write-Host 'LIVE VALIDATE ERROR CATEGORY: apply'
+            throw 'Patch application failed; details are suppressed.'
+          }
+
       - name: Run privacy-safe validation and package
         shell: pwsh
         env:
@@ -261,7 +285,11 @@ jobs:
           FULL_BUILD: ${{ matrix.full_build }}
           RELEASE_REPO: ${{ github.repository }}
         run: |
-          $args = @(
+          if ([string]::IsNullOrWhiteSpace($env:VERSION)) {
+            Write-Host 'LIVE VALIDATE ERROR CATEGORY: version-env'
+            throw 'Release version was not provided to the build step; details are suppressed.'
+          }
+          $buildArgs = @(
             '-NoProfile', '-File', './scripts/dry-run-build.ps1',
             '-ManagerDir', $env:MANAGER_DIR,
             '-SourceDir', $env:SOURCE_DIR,
@@ -269,8 +297,9 @@ jobs:
             '-Version', $env:VERSION,
             '-Repository', $env:RELEASE_REPO
           )
-          if ($env:FULL_BUILD -eq 'true') { $args += '-FullBuild' }
-          & pwsh @args
+          if ($env:FULL_BUILD -eq 'true') { $buildArgs += '-FullBuild' }
+          $buildArgs += '-SkipApply'
+          & pwsh @buildArgs
           if ($LASTEXITCODE -ne 0) {
             Write-Host "LIVE VALIDATE ERROR CATEGORY: build-$env:PLATFORM"
             throw 'Validation or packaging failed; details are suppressed.'

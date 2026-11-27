@@ -31,6 +31,18 @@ function Invoke-Captured {
         & $FilePath @Arguments *> $log
         if ($LASTEXITCODE -ne 0) { throw "$Label failed" }
     }
+    catch {
+        $stage = switch ($Label) {
+            'apply-patches' { 'apply'; break }
+            'install-dependencies' { 'install'; break }
+            'verify-source' { 'typecheck'; break }
+            'stamp-version' { 'stamp'; break }
+            'package-desktop' { 'package'; break }
+            default { $safeLabel; break }
+        }
+        Write-Host "DRY RUN ERROR CATEGORY: $stage-$Platform"
+        throw "Build stage '$stage' failed; details are suppressed."
+    }
     finally {
         Pop-Location
     }
@@ -71,13 +83,7 @@ try {
     $env:CLI_PLATFORM = if ($Platform -eq 'windows') { 'win' } else { 'linux' }
     $env:BUILD_TARGET = if ($Platform -eq 'windows') { 'nsis' } else { 'AppImage' }
     $target = @('--platform', $env:CLI_PLATFORM, '--target', $env:BUILD_TARGET, '--arch', 'x64', '--verbose')
-    try {
-        Invoke-Captured -Label 'package-desktop' -WorkingDirectory $SourceDir -FilePath 'vp' -Arguments (@('run', 'dist:desktop:artifact') + $target + @('--build-version', $Version))
-    }
-    catch {
-        Write-Host "DRY RUN ERROR CATEGORY: package-desktop-command-$Platform"
-        throw 'Desktop packaging failed; details are suppressed.'
-    }
+    Invoke-Captured -Label 'package-desktop' -WorkingDirectory $SourceDir -FilePath 'vp' -Arguments (@('run', 'dist:desktop:artifact') + $target + @('--build-version', $Version))
 }
 finally {
     if ($null -eq $oldOutput) { Remove-Item Env:T3CODE_DESKTOP_OUTPUT_DIR -ErrorAction SilentlyContinue } else { $env:T3CODE_DESKTOP_OUTPUT_DIR = $oldOutput }
@@ -89,19 +95,19 @@ finally {
 
 $assetCount = @(Get-ChildItem -LiteralPath $output -File -ErrorAction SilentlyContinue).Count
 if ($assetCount -lt 1) {
-    Write-Host "DRY RUN ERROR CATEGORY: package-desktop-assets-$Platform"
+    Write-Host "DRY RUN ERROR CATEGORY: assets-$Platform"
     throw 'The desktop package produced no release assets.'
 }
 if ($Platform -eq 'windows') {
     $exe = Get-ChildItem -LiteralPath $output -Filter '*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $exe -or -not (Test-Path -LiteralPath "$($exe.FullName).blockmap") -or -not (Test-Path -LiteralPath (Join-Path $output 'latest.yml'))) {
-        Write-Host 'DRY RUN ERROR CATEGORY: package-desktop-assets-windows'
+        Write-Host 'DRY RUN ERROR CATEGORY: assets-windows'
         throw 'The Windows package is missing an installer, blockmap, or latest.yml.'
     }
 }
 else {
     if (-not (Get-ChildItem -LiteralPath $output -Filter '*.AppImage' -File -ErrorAction SilentlyContinue | Select-Object -First 1) -or -not (Test-Path -LiteralPath (Join-Path $output 'latest-linux.yml'))) {
-        Write-Host 'DRY RUN ERROR CATEGORY: package-desktop-assets-linux'
+        Write-Host 'DRY RUN ERROR CATEGORY: assets-linux'
         throw 'The Linux package is missing an AppImage or latest-linux.yml.'
     }
 }
