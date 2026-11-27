@@ -1,0 +1,38 @@
+name: Repair stable patch stack (dry run)
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [repair-stable]
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    name: Inspect repair inputs without changing anything
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout public workflow repository
+        uses: actions/checkout@v4
+
+      - name: Clone private patch manager
+        shell: pwsh
+        env:
+          PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
+          PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
+          PRIVATE_REPO_READ_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          MANAGER_DIR: ${{ runner.temp }}/private-manager
+        run: |
+          pwsh -NoProfile -File ./scripts/secure-clone.ps1 `
+            -Owner $env:PRIVATE_REPO_OWNER `
+            -Name $env:PRIVATE_REPO_NAME `
+            -Token $env:PRIVATE_REPO_READ_TOKEN `
+            -Destination $env:MANAGER_DIR
+          if ($LASTEXITCODE -ne 0) { throw 'Could not clone the private patch manager.' }
+          $required = @('upstream.lock.json', 'patches/series.txt', 'scripts/prepare-repair.ps1', 'scripts/apply-patches.ps1')
+          foreach ($path in $required) {
+            if (-not (Test-Path -LiteralPath (Join-Path $env:MANAGER_DIR $path))) { throw 'A required repair input is missing.' }
+          }
+          Write-Host 'DRY RUN ONLY: repair inputs are present; no repair branch, commit, or PR was created.'

@@ -1,0 +1,53 @@
+name: Auto-merge private pull request (dry run)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Private pull request number to inspect
+        required: true
+        default: '38'
+        type: string
+  repository_dispatch:
+    types: [auto-merge]
+  schedule:
+    - cron: '41 */2 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-dry-auto-merge
+  cancel-in-progress: true
+
+jobs:
+  inspect:
+    name: Check merge eligibility without merging
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout public workflow repository
+        uses: actions/checkout@v4
+
+      - name: Read private pull request metadata
+        shell: pwsh
+        env:
+          PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
+          PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
+          PRIVATE_REPO_READ_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.client_payload.pr_number || '38' }}
+        run: |
+          $json = pwsh -NoProfile -File ./scripts/read-private-pr.ps1 `
+            -Owner $env:PRIVATE_REPO_OWNER `
+            -Name $env:PRIVATE_REPO_NAME `
+            -Token $env:PRIVATE_REPO_READ_TOKEN `
+            -Number ([int]$env:PR_NUMBER)
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read the private pull request.' }
+          $pr = $json | ConvertFrom-Json
+          if ($pr.baseRef -ne 'master' -or $pr.crossRepository) { throw 'The pull request is not eligible for merge.' }
+          if ($pr.draft) {
+            Write-Host "DRY RUN ONLY: PR #$($pr.number) is draft; no merge would be attempted."
+          } else {
+            Write-Host "DRY RUN ONLY: PR #$($pr.number) at $($pr.headSha) is non-draft; a live workflow would recheck validation status and head SHA before merging."
+          }
+          Write-Host 'No merge token was used and no private repository state was changed.'

@@ -1,0 +1,115 @@
+name: Build patched desktop package (dry run)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Private pull request number to build
+        required: true
+        default: '38'
+        type: string
+      platform:
+        description: Runner/package target
+        required: true
+        default: windows
+        type: choice
+        options:
+          - windows
+          - linux
+      full_build:
+        description: Package after the source verification preflight
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Local-only patched build
+    runs-on: ${{ inputs.platform == 'linux' && 'ubuntu-latest' || 'windows-latest' }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout public workflow repository
+        uses: actions/checkout@v4
+
+      - name: Read private pull request metadata
+        id: pr
+        shell: pwsh
+        env:
+          PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
+          PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
+          PRIVATE_REPO_READ_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          $json = pwsh -NoProfile -File ./scripts/read-private-pr.ps1 `
+            -Owner $env:PRIVATE_REPO_OWNER `
+            -Name $env:PRIVATE_REPO_NAME `
+            -Token $env:PRIVATE_REPO_READ_TOKEN `
+            -Number ([int]$env:PR_NUMBER)
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read the private pull request.' }
+          $pr = $json | ConvertFrom-Json
+          if ($pr.baseRef -ne 'master' -or $pr.crossRepository) { throw 'The pull request is not eligible for this dry run.' }
+          "head_sha=$($pr.headSha)" >> $env:GITHUB_OUTPUT
+
+      - name: Clone exact private pull request head
+        shell: pwsh
+        env:
+          PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
+          PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
+          PRIVATE_REPO_READ_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          MANAGER_DIR: ${{ runner.temp }}/private-manager
+          SOURCE_DIR: ${{ runner.temp }}/upstream-source
+        run: |
+          pwsh -NoProfile -File ./scripts/secure-clone.ps1 `
+            -Owner $env:PRIVATE_REPO_OWNER `
+            -Name $env:PRIVATE_REPO_NAME `
+            -Token $env:PRIVATE_REPO_READ_TOKEN `
+            -Destination $env:MANAGER_DIR `
+            -PullNumber ([int]$env:PR_NUMBER) `
+            -Revision $env:HEAD_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Could not clone the private pull request.' }
+          "MANAGER_DIR=$env:MANAGER_DIR" >> $env:GITHUB_ENV
+          "SOURCE_DIR=$env:SOURCE_DIR" >> $env:GITHUB_ENV
+
+      - name: Apply patches with suppressed output
+        shell: pwsh
+        env:
+          MANAGER_DIR: ${{ runner.temp }}/private-manager
+          SOURCE_DIR: ${{ runner.temp }}/upstream-source
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'apply-patches.log'
+          & pwsh -NoProfile -File (Join-Path $env:MANAGER_DIR 'scripts/apply-patches.ps1') -SourceDir $env:SOURCE_DIR *> $log
+          if ($LASTEXITCODE -ne 0) { throw 'Patch application failed; details are suppressed.' }
+
+      - name: Set up Vite+
+        uses: voidzero-dev/setup-vp@v1.21.2
+        with:
+          working-directory: ${{ runner.temp }}/upstream-source
+          node-version-file: ${{ runner.temp }}/upstream-source/package.json
+          cache: false
+          run-install: false
+
+      - name: Run local-only build
+        shell: pwsh
+        env:
+          MANAGER_DIR: ${{ runner.temp }}/private-manager
+          SOURCE_DIR: ${{ runner.temp }}/upstream-source
+        run: |
+          $lock = Get-Content -LiteralPath (Join-Path $env:MANAGER_DIR 'upstream.lock.json') -Raw | ConvertFrom-Json
+          $version = "$($lock.stableVersion.TrimStart('v'))-dryrun"
+          $args = @(
+            '-NoProfile', '-File', './scripts/dry-run-build.ps1',
+            '-ManagerDir', $env:MANAGER_DIR,
+            '-SourceDir', $env:SOURCE_DIR,
+            '-Platform', '${{ inputs.platform }}',
+            '-Version', $version,
+            '-Repository', $env:GITHUB_REPOSITORY,
+            '-SkipApply'
+          )
+          if ('${{ inputs.full_build }}' -eq 'true') { $args += '-FullBuild' }
+          & pwsh @args
+          if ($LASTEXITCODE -ne 0) { throw 'Local-only build failed; details are suppressed.' }

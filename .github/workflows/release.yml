@@ -1,0 +1,151 @@
+name: Plan custom release (dry run)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Private stable branch or ref to inspect
+        required: true
+        default: master
+        type: string
+      full_build:
+        description: Run local Windows and Linux packaging after planning
+        required: true
+        default: false
+        type: boolean
+  repository_dispatch:
+    types: [release]
+  schedule:
+    - cron: '53 */4 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-dry-release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan stable custom version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - name: Checkout public workflow repository
+        uses: actions/checkout@v4
+
+      - name: Clone private stable ref
+        shell: pwsh
+        env:
+          PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
+          PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
+          PRIVATE_REPO_READ_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          SOURCE_REF: ${{ inputs.source_ref || 'master' }}
+          MANAGER_DIR: ${{ runner.temp }}/private-manager
+        run: |
+          pwsh -NoProfile -File ./scripts/secure-clone.ps1 `
+            -Owner $env:PRIVATE_REPO_OWNER `
+            -Name $env:PRIVATE_REPO_NAME `
+            -Token $env:PRIVATE_REPO_READ_TOKEN `
+            -Destination $env:MANAGER_DIR `
+            -Branch $env:SOURCE_REF
+          if ($LASTEXITCODE -ne 0) { throw 'Could not clone the private stable ref.' }
+          "MANAGER_DIR=$env:MANAGER_DIR" >> $env:GITHUB_ENV
+
+      - name: Compute next custom stable version
+        id: plan
+        shell: pwsh
+        env:
+          MANAGER_DIR: ${{ runner.temp }}/private-manager
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $lock = Get-Content -LiteralPath (Join-Path $env:MANAGER_DIR 'upstream.lock.json') -Raw | ConvertFrom-Json
+          if ($lock.channel -ne 'stable') { throw 'The private lock is not on the stable channel.' }
+          $identityLog = Join-Path $env:RUNNER_TEMP 'identity.log'
+          & pwsh -NoProfile -File (Join-Path $env:MANAGER_DIR 'scripts/get-build-identity.ps1') *> $identityLog
+          if ($LASTEXITCODE -ne 0) { throw 'Build identity planning failed; details are suppressed.' }
+          $identity = Get-Content -LiteralPath $identityLog -Raw | ConvertFrom-Json
+          $releaseLog = Join-Path $env:RUNNER_TEMP 'release-version.log'
+          & pwsh -NoProfile -File (Join-Path $env:MANAGER_DIR 'scripts/get-release-version.ps1') `
+            -Repository $env:GITHUB_REPOSITORY `
+            -Fingerprint $identity.fingerprint *> $releaseLog
+          if ($LASTEXITCODE -ne 0) { throw 'Release version planning failed; details are suppressed.' }
+          $release = Get-Content -LiteralPath $releaseLog -Raw | ConvertFrom-Json
+          "version=$($release.version)" >> $env:GITHUB_OUTPUT
+          "tag=$($release.tag)" >> $env:GITHUB_OUTPUT
+          Write-Host "DRY RUN ONLY: stable $($lock.stableTag) plans custom release $($release.tag)."
+          Write-Host 'No release, tag, asset, checksum, or repository setting was created.'
+
+  package:
+    name: Local release package (${{ matrix.platform }})
+    needs: plan
+    if: github.event_name == 'workflow_dispatch' && inputs.full_build == true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            runner: windows-latest
+          - platform: linux
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout public workflow repository
+        uses: actions/checkout@v4
+
+      - name: Clone private stable ref
+        shell: pwsh
+        env:
+          PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
+          PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
+          PRIVATE_REPO_READ_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          SOURCE_REF: ${{ inputs.source_ref || 'master' }}
+          MANAGER_DIR: ${{ runner.temp }}/private-manager
+        run: |
+          pwsh -NoProfile -File ./scripts/secure-clone.ps1 `
+            -Owner $env:PRIVATE_REPO_OWNER `
+            -Name $env:PRIVATE_REPO_NAME `
+            -Token $env:PRIVATE_REPO_READ_TOKEN `
+            -Destination $env:MANAGER_DIR `
+            -Branch $env:SOURCE_REF
+          if ($LASTEXITCODE -ne 0) { throw 'Could not clone the private stable ref.' }
+          "MANAGER_DIR=$env:MANAGER_DIR" >> $env:GITHUB_ENV
+          "SOURCE_DIR=$env:RUNNER_TEMP/upstream-source" >> $env:GITHUB_ENV
+
+      - name: Apply patches with suppressed output
+        shell: pwsh
+        env:
+          MANAGER_DIR: ${{ runner.temp }}/private-manager
+          SOURCE_DIR: ${{ runner.temp }}/upstream-source
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'apply-patches.log'
+          & pwsh -NoProfile -File (Join-Path $env:MANAGER_DIR 'scripts/apply-patches.ps1') -SourceDir $env:SOURCE_DIR *> $log
+          if ($LASTEXITCODE -ne 0) { throw 'Patch application failed; details are suppressed.' }
+
+      - name: Set up Vite+
+        uses: voidzero-dev/setup-vp@v1.21.2
+        with:
+          working-directory: ${{ runner.temp }}/upstream-source
+          node-version-file: ${{ runner.temp }}/upstream-source/package.json
+          cache: false
+          run-install: false
+
+      - name: Run local release package dry run
+        shell: pwsh
+        env:
+          MANAGER_DIR: ${{ runner.temp }}/private-manager
+          SOURCE_DIR: ${{ runner.temp }}/upstream-source
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          pwsh -NoProfile -File ./scripts/dry-run-build.ps1 `
+            -ManagerDir $env:MANAGER_DIR `
+            -SourceDir $env:SOURCE_DIR `
+            -Platform '${{ matrix.platform }}' `
+            -Version $env:VERSION `
+            -Repository $env:GITHUB_REPOSITORY `
+            -FullBuild `
+            -SkipApply

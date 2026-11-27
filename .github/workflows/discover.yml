@@ -1,0 +1,59 @@
+name: Discover upstream stable release (dry run)
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [discover]
+  schedule:
+    - cron: '17 */2 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-dry-discover
+  cancel-in-progress: true
+
+jobs:
+  discover:
+    name: Compare upstream stable release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout public workflow repository
+        uses: actions/checkout@v4
+
+      - name: Clone private patch manager
+        shell: pwsh
+        env:
+          PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
+          PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
+          PRIVATE_REPO_READ_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          MANAGER_DIR: ${{ runner.temp }}/private-manager
+        run: |
+          pwsh -NoProfile -File ./scripts/secure-clone.ps1 `
+            -Owner $env:PRIVATE_REPO_OWNER `
+            -Name $env:PRIVATE_REPO_NAME `
+            -Token $env:PRIVATE_REPO_READ_TOKEN `
+            -Destination $env:MANAGER_DIR
+          if ($LASTEXITCODE -ne 0) { throw 'Could not clone the private patch manager.' }
+          "MANAGER_DIR=$env:MANAGER_DIR" >> $env:GITHUB_ENV
+
+      - name: Compare public upstream metadata with the private lock
+        shell: pwsh
+        env:
+          MANAGER_DIR: ${{ runner.temp }}/private-manager
+        run: |
+          try {
+            $releases = Invoke-RestMethod -Method Get -Uri 'https://api.github.com/repos/pingdotgg/t3code/releases?per_page=100' -Headers @{ Accept = 'application/vnd.github+json' }
+            $latest = @($releases | Where-Object { -not $_.draft -and -not $_.prerelease -and $_.tag_name -notmatch '-nightly\.' } | Sort-Object published_at | Select-Object -Last 1)
+            if (-not $latest) { throw 'No upstream stable release was found.' }
+            $lock = Get-Content -LiteralPath (Join-Path $env:MANAGER_DIR 'upstream.lock.json') -Raw | ConvertFrom-Json
+            if ($lock.channel -ne 'stable') { throw 'The private lock is not on the stable channel.' }
+            $same = $latest.tag_name -eq $lock.stableTag
+            Write-Host "DRY RUN ONLY: upstream stable $($latest.tag_name); locked stable $($lock.stableTag); changed=$($same -eq $false)."
+            Write-Host 'No branch, commit, pull request, or repository setting was changed.'
+          }
+          catch {
+            throw 'Stable-release comparison failed; details are suppressed.'
+          }
