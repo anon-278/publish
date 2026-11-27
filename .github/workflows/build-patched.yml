@@ -28,7 +28,8 @@ permissions:
 jobs:
   build:
     name: Local-only patched build
-    runs-on: ${{ inputs.platform == 'linux' && 'ubuntu-latest' || 'windows-latest' }}
+    # Match upstream's Linux glibc ceiling; ubuntu-latest can be too new.
+    runs-on: ${{ inputs.platform == 'linux' && 'ubuntu-24.04' || 'windows-latest' }}
     timeout-minutes: 45
     steps:
       - name: Checkout public workflow repository
@@ -74,6 +75,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Could not clone the private pull request.' }
           "MANAGER_DIR=$env:MANAGER_DIR" >> $env:GITHUB_ENV
           "SOURCE_DIR=$env:SOURCE_DIR" >> $env:GITHUB_ENV
+
+      - name: Install Linux desktop build libraries
+        if: inputs.platform == 'linux'
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libsecret-1-dev pkg-config imagemagick libgtk-3-0t64 libnss3 libasound2t64 libgbm1
+
+      - name: Set up Rust for Linux native helpers
+        if: inputs.platform == 'linux'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
 
       - name: Apply patches with suppressed output
         shell: pwsh
