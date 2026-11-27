@@ -1,12 +1,18 @@
-name: Auto-merge private pull request (dry run)
+name: Auto-merge validated private pull requests
+
+# There is no private PR trigger in the public repository. This
+# poller merges only a same-repository, non-draft PR whose exact head SHA has
+# both release-grade validation statuses from validate.yml.
 
 on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
     inputs:
       pr_number:
-        description: Private pull request number to inspect
-        required: true
-        default: '38'
+        description: Private pull request number, or all open pull requests
+        required: false
+        default: all
         type: string
   repository_dispatch:
     types: [auto-merge]
@@ -15,37 +21,110 @@ permissions:
   contents: read
 
 concurrency:
-  group: public-dry-auto-merge
-  cancel-in-progress: true
+  group: public-auto-merge
+  cancel-in-progress: false
 
 jobs:
-  inspect:
-    name: Check merge eligibility without merging
+  merge:
+    name: Merge eligible private pull requests
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - name: Checkout public workflow repository
-        uses: actions/checkout@v4
-
-      - name: Read private pull request metadata
+      - name: Poll and merge eligible pull requests
         shell: pwsh
         env:
           PRIVATE_REPO_OWNER: ${{ secrets.PRIVATE_REPO_OWNER }}
           PRIVATE_REPO_NAME: ${{ secrets.PRIVATE_REPO_NAME }}
-          PRIVATE_REPO_READ_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
-          PR_NUMBER: ${{ inputs.pr_number || github.event.client_payload.pr_number || '38' }}
+          PRIVATE_REPO_MERGE_TOKEN: ${{ secrets.PRIVATE_REPO_MERGE_TOKEN }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.client_payload.pr_number || 'all' }}
         run: |
-          $json = pwsh -NoProfile -File ./scripts/read-private-pr.ps1 `
-            -Owner $env:PRIVATE_REPO_OWNER `
-            -Name $env:PRIVATE_REPO_NAME `
-            -Token $env:PRIVATE_REPO_READ_TOKEN `
-            -Number ([int]$env:PR_NUMBER)
-          if ($LASTEXITCODE -ne 0) { throw 'Could not read the private pull request.' }
-          $pr = $json | ConvertFrom-Json
-          if ($pr.baseRef -ne 'master' -or $pr.crossRepository) { throw 'The pull request is not eligible for merge.' }
-          if ($pr.draft) {
-            Write-Host "DRY RUN ONLY: PR #$($pr.number) is draft; no merge would be attempted."
-          } else {
-            Write-Host "DRY RUN ONLY: PR #$($pr.number) at $($pr.headSha) is non-draft; a live workflow would recheck validation status and head SHA before merging."
+          $repo = "$env:PRIVATE_REPO_OWNER/$env:PRIVATE_REPO_NAME"
+          Write-Output "::add-mask::$repo"
+          Write-Output "::add-mask::https://github.com/$repo"
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:PRIVATE_REPO_MERGE_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
           }
-          Write-Host 'No merge token was used and no private repository state was changed.'
+          function Get-PrivateApi([string] $Path) {
+            try {
+              return Invoke-RestMethod -Method Get -Uri "https://api.github.com/repos/$repo/$Path" -Headers $headers -ErrorAction Stop
+            }
+            catch {
+              throw 'Private pull request polling failed; details are suppressed.'
+            }
+          }
+
+          $requested = $env:PR_NUMBER.Trim()
+          if ($requested -eq 'all' -or -not $requested) {
+            $pulls = @(Get-PrivateApi 'pulls?state=open&base=master&per_page=100')
+          }
+          else {
+            if ($requested -notmatch '^\d+$' -or [int]$requested -lt 1) { throw 'The requested pull request number is invalid.' }
+            $pulls = @(Get-PrivateApi "pulls/$requested")
+          }
+
+          $candidates = @(
+            $pulls | Where-Object {
+              $_.state -eq 'open' -and
+              $_.base.ref -eq 'master' -and
+              $_.head.repo.full_name -eq $repo -and
+              -not $_.draft
+            }
+          )
+          if ($requested -ne 'all' -and $candidates.Count -eq 0) {
+            Write-Host 'No eligible non-draft private pull request was found.'
+            exit 0
+          }
+
+          foreach ($pr in $candidates) {
+            $status = Get-PrivateApi "commits/$($pr.head.sha)/status"
+            $required = @('custom-validate/windows', 'custom-validate/linux')
+            $ready = $true
+            foreach ($context in $required) {
+              $latest = @(
+                $status.statuses |
+                  Where-Object { $_.context -eq $context } |
+                  Sort-Object { [DateTimeOffset]$_.updated_at } -Descending |
+                  Select-Object -First 1
+              )
+              if ($latest.Count -eq 0 -or $latest[0].state -ne 'success') {
+                $ready = $false
+                break
+              }
+            }
+            if (-not $ready) {
+              Write-Host "PR #$($pr.number) is waiting for both exact-head validation statuses."
+              continue
+            }
+
+            $mergeBody = @{ sha = $pr.head.sha; merge_method = 'squash' } | ConvertTo-Json -Compress
+            try {
+              $merged = Invoke-RestMethod -Method Put `
+                -Uri "https://api.github.com/repos/$repo/pulls/$($pr.number)/merge" `
+                -Headers $headers -ContentType 'application/json' -Body $mergeBody -ErrorAction Stop
+            }
+            catch {
+              Write-Host "LIVE AUTO-MERGE ERROR CATEGORY: merge-request-$($pr.number)"
+              Write-Host "PR #$($pr.number) could not be merged; it will be retried on the next poll."
+              continue
+            }
+            if (-not $merged.merged) {
+              Write-Host "LIVE AUTO-MERGE ERROR CATEGORY: merge-rejected-$($pr.number)"
+              Write-Host "PR #$($pr.number) was not merged; it will be retried on the next poll."
+              continue
+            }
+            Write-Host "Merged PR #$($pr.number) after exact-head validation."
+
+            if ($pr.head.ref -and $pr.head.ref -ne 'master') {
+              try {
+                Invoke-RestMethod -Method Delete `
+                  -Uri "https://api.github.com/repos/$repo/git/refs/heads/$([uri]::EscapeDataString($pr.head.ref))" `
+                  -Headers $headers -ErrorAction Stop | Out-Null
+              }
+              catch {
+                Write-Host "Branch cleanup for PR #$($pr.number) was not completed; the merge succeeded."
+              }
+            }
+          }
+          exit 0
