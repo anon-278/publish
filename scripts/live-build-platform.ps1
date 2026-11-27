@@ -144,10 +144,35 @@ else {
 }
 
 foreach ($name in $required) {
-    $source = if ($name -like 't3-*') { Join-Path $cliOutput $name } else { Join-Path $desktopOutput $name }
+    # PowerShell's -like comparison is case-insensitive, so `-like 't3-*'`
+    # also matches desktop names such as `T3-Code-...`.  Classify only the
+    # exact archive name as CLI output; all other required assets are desktop
+    # output.
+    $isCliArchive = $name -eq $expectedCli
+    $source = if ($isCliArchive) { Join-Path $cliOutput $name } else { Join-Path $desktopOutput $name }
     if (-not (Test-Path -LiteralPath $source)) {
-        Write-Host "LIVE RELEASE ERROR CATEGORY: release-assets-$Platform"
-        throw 'A required release asset is missing.'
+        $assetKind = if ($isCliArchive) {
+            'cli-archive'
+        }
+        elseif ($name -like '*.blockmap') {
+            'blockmap'
+        }
+        elseif ($name -like '*.AppImage') {
+            'appimage'
+        }
+        elseif ($name -like '*.exe') {
+            'installer'
+        }
+        elseif ($name -like 'latest*.yml') {
+            'update-feed'
+        }
+        else {
+            'asset'
+        }
+        $safeName = $name -replace '[^A-Za-z0-9._-]', '_'
+        Write-Host "LIVE RELEASE ERROR CATEGORY: release-assets-$Platform-missing-$assetKind"
+        Write-Host "LIVE RELEASE ASSET CHECK: missing $safeName"
+        throw "Required $assetKind asset is missing."
     }
     Copy-Item -LiteralPath $source -Destination $assetDir
 }

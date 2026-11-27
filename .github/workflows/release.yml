@@ -304,8 +304,15 @@ jobs:
           $missing = @($expected | Where-Object { $_ -notin $actual })
           $extra = @($actual | Where-Object { $_ -notin $expected })
           if ($missing.Count -or $extra.Count) {
-            Write-Host 'LIVE RELEASE ERROR CATEGORY: release-asset-set'
-            throw 'The staged release does not contain exactly the expected seven pre-checksum assets.'
+            foreach ($name in $missing) {
+              $safeName = $name -replace '[^A-Za-z0-9._-]', '_'
+              Write-Host "LIVE RELEASE ERROR CATEGORY: release-asset-set-missing-$safeName"
+            }
+            foreach ($name in $extra) {
+              $safeName = $name -replace '[^A-Za-z0-9._-]', '_'
+              Write-Host "LIVE RELEASE ERROR CATEGORY: release-asset-set-unexpected-$safeName"
+            }
+            throw 'The staged release asset set did not match the expected public assets.'
           }
           $lines = foreach ($file in Get-ChildItem -LiteralPath release-assets -File | Sort-Object Name) {
             $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -341,7 +348,7 @@ jobs:
             -Repository $env:GITHUB_REPOSITORY `
             -RequireChecksums *> $log
           if ($LASTEXITCODE -ne 0) {
-            Write-Host 'LIVE RELEASE ERROR CATEGORY: asset-validation'
+            Write-Host 'LIVE RELEASE ERROR CATEGORY: asset-validation-checksum-or-metadata'
             throw 'Release asset validation failed; details are suppressed.'
           }
           exit 0
